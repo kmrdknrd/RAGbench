@@ -1,5 +1,5 @@
 # RAGbench
-RAGbench.py emulates the AnythingLLM RAG pipeline
+RAGbench.py emulates the AnythingLLM RAG pipeline for benchmarking the different text and model settings
 
 - PdfProcessor() reads .pdf's into Python
 - BiEncoderPipeline() sets up a bi-encoder for text chunking and embedding, and – given a user query – retrieving semantically similar embeddings
