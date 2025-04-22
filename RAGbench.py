@@ -17,6 +17,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 from marker.output import text_from_rendered
+from FlagEmbedding import FlagLLMReranker, LayerWiseFlagLLMReranker
 import requests
 import json
 
@@ -168,6 +169,47 @@ class CrossEncoderPipeline:
         results_sorted = sorted(results, key=lambda x: x['rerank_score'], reverse=True)
         return results_sorted[:top_n]
 
+class FlagEmbeddingReranker:
+    def __init__(
+        self, 
+        model_name="BAAI/bge-reranker-v2-gemma", 
+        use_fp16=True, 
+        use_bf16=False
+    ):
+        """
+        Initialize with FlagLLMReranker model
+        
+        Args:
+            model_name: Name of the reranker model
+            use_fp16: Use FP16 precision (faster with slight performance loss)
+            use_bf16: Use BF16 precision (alternative to FP16)
+        """
+        if use_bf16:
+            self.reranker = LayerWiseFlagLLMReranker(model_name, use_bf16=True)
+        else:
+            self.reranker = LayerWiseFlagLLMReranker(model_name, use_fp16=use_fp16)
+    
+    def rerank(self, query, documents, top_n=4):
+        """Rerank documents using FlagLLMReranker"""
+        # Extract texts and create query-passage pairs
+        pairs = [[query, doc["text"]] for doc in documents]
+        
+        # Compute scores for all pairs
+        scores = self.reranker.compute_score(pairs, cutoff_layers=[28])[0]
+        
+        # Add scores to documents and sort
+        results = [
+            {**doc, "rerank_score": float(score)} 
+            for doc, score in zip(documents, scores)
+        ]
+        
+        # Return top results
+        return sorted(
+            results, 
+            key=lambda x: x['rerank_score'], 
+            reverse=True
+        )[:top_n]
+    
 class LocalBiEncoderPipeline:
     def __init__(self, 
                  model_name="text-embedding-bge-m3",
