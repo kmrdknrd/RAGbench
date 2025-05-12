@@ -451,57 +451,8 @@ def compute_recall(results_list):
 # Pipeline initialization
 # pdf_processor = PdfProcessor()
 # bi_encoder = BiEncoderPipeline()
-cross_encoder = CrossEncoderPipeline()
-cross_encoder_test = CrossEncoderPipeline(model_name="")
+cross_encoder = CrossEncoderPipeline(model_name="Alibaba-NLP/gte-reranker-modernbert-base")
 
-# ###### Single document (.pdf) test #####
-# # Document processing
-# doc_path = Path("data/my_docs/ekbia2016.pdf")
-# document_text = pdf_processor.process_document(doc_path)
-
-# # Embedding
-# embedded_docs = bi_encoder.embed_documents(document_text)
-
-# # Retrieval and reranking
-# query = "What is the point of a political economy perspective on HCI?"
-# top_chunks = bi_encoder.retrieve_top_k(query, embedded_docs, top_k=25)
-# reranked_results = cross_encoder.rerank(query, top_chunks)
-
-# # Print reranked results, without the "vector" key
-# results_df = pd.DataFrame(reranked_results)
-# results_df = results_df.drop(columns=["vector"])
-# print(results_df)
-# ##### End of single document (.pdf) test #####
-
-
-# ##### Multiple documents (.pdf) test #####
-# # Document processing
-# docs_path = Path("data/my_docs")
-# docs_texts = pdf_processor.process_document(docs_path)
-
-# # Embedding
-# embedded_docs = bi_encoder.embed_documents(docs_texts)
-
-# # Retrieval and reranking
-# query = "What is the point of a political perspective on HCI?"
-# top_chunks = bi_encoder.retrieve_top_k(query, embedded_docs, top_k=25)
-# reranked_results = cross_encoder.rerank(query, top_chunks)
-
-# # Print reranked results, without the "vector" key
-# results_df = pd.DataFrame(reranked_results)
-# results_df = results_df.drop(columns=["vector"])
-# print(results_df)
-# ##### End of multiple documents (.pdf) test #####
-
-# # Quick test, single .pdf
-# doc_path = Path("data/my_docs/ekbia2016.pdf")
-# query = "What is the point of a political economy perspective on HCI?"
-# quick_test(bi_encoder, cross_encoder, pdf_processor, doc_path, query)
-
-# # Quick test, multiple .pdfs
-# docs_path = Path("data/my_docs")
-# query = "What is the point of a political perspective on HCI?"
-# quick_test(bi_encoder, cross_encoder, pdf_processor, docs_path, query)
 
 ##################### TECHQA #####################
 ## Load dataset
@@ -589,14 +540,14 @@ with open("techqa_exp.pkl", "rb") as f:
 #     techqa_embed = pickle.load(f)
 
 techqa_questions = techqa.question.tolist()
-chunk_size = [1024, 2048, 4096, 8192]
+chunk_size = [4096, 8192]
 chunk_overlap = [0, 128]
 for c_size in chunk_size:
     for c_overlap in chunk_overlap:
         print(f"c_size: {c_size}, c_overlap: {c_overlap}")
         
         # if c_size == 1024 and c_overlap == 0:
-        #     continue # already done
+        #     continue
         
         bi_encoder_text_embedding = BiEncoderPipeline(
             model_name="Snowflake/snowflake-arctic-embed-l-v2.0",
@@ -687,24 +638,16 @@ for c_size in chunk_size:
                 ## Check conditions        
                 sentence_100_match = size == len(sentence_no_punct)
                 if sentence_100_match:
-                    print("MATCH FULL, chunk contains the whole sentence, MATCH")
-                    print(f"key: {key}")
                     techqa_embed[i]["sentence_matches"].append(key)
-                    # techqa_embed[i]["match_types"].append("full")
                     last_match_key = doc_dict_keys.index(key)
                     
                     # Remove first instance of matching part
                     chunk_no_punct = chunk_no_punct.replace(matching_part, "", 1)
-                    
                     continue
                 
                 chunk_100_match = size == len(chunk_no_punct)
                 if chunk_100_match:
-                    # print("MATCH FULL, sentence contains the whole chunk, MATCH")
-                    print(f"key: {key}")
-                    print("NEXT CHUNK")
                     techqa_embed[i]["sentence_matches"].append(key)
-                    # techqa_embed[i]["match_types"].append("full")
                     last_match_key = doc_dict_keys.index(key)
                     break # If the sentence contains the whole chunk, then the next sentences will not contain any more matches
         
@@ -712,38 +655,22 @@ for c_size in chunk_size:
                 no_text_after = pos_b + size == len(sentence_no_punct) # The match is at the end of the sentence (i.e., no text in the sentence after the match)
                 matching_ratio = len(sentence_no_punct[pos_b:pos_b+size]) / len(sentence_no_punct) # Portion of the sentence that contains the match
                 if contains_start and no_text_after and matching_ratio >= 0.5:
-                    # print("MATCH PARTIAL, sentence contains start of chunk, no irrelevant text after")
-                    print(f"key: {key}")
                     techqa_embed[i]["sentence_matches"].append(key)
-                    # techqa_embed[i]["match_types"].append("partial")
                     last_match_key = doc_dict_keys.index(key)
                     
                     chunk_no_punct = chunk_no_punct.replace(matching_part, "", 1)
-                    # matching_part_count = chunk_no_punct.count(matching_part)
-                    # if matching_part_count > 1:
-                    #     print("M: matching part occurs more than once in the chunk")
-                    #     m_counter += 1
                     continue
                     
                 contains_end = pos_a + size == len(chunk_no_punct) # The match is at the end of the chunk (i.e., no text in the chunk after the match)
                 no_text_before = pos_b == 0 # The match starts at the beginning of the sentence (i.e., no text in the sentence before the match)
                 if contains_end and no_text_before and matching_ratio >= 0.5:
-                    # print("MATCH PARTIAL, sentence contains end of chunk, no irrelevant text before")
-                    print(f"key: {key}")
                     techqa_embed[i]["sentence_matches"].append(key)
-                    # techqa_embed[i]["match_types"].append("partial")
                     last_match_key = doc_dict_keys.index(key)
                     
                     chunk_no_punct = chunk_no_punct.replace(matching_part, "", 1)
-                    # matching_part_count = chunk_no_punct.count(matching_part)
-                    # if matching_part_count > 1:
-                    #     print("M: matching part occurs more than once in the chunk")
-                    #     m_counter += 1
                     continue
                 
                 else:
-                    print("NO MATCH that matches the conditions")
-                    print(no_match_counter)
                     if sentence_idx > 0: # Because we go back an extra key for the previous chunk, don't count no_match_counter for the first sentence
                         no_match_counter += 1
                         if no_match_counter > 2:
@@ -754,6 +681,11 @@ for c_size in chunk_size:
         techqa_embed_final = techqa_embed
         with open(f"techqa_embeddings/Snowflake/size-{c_size}_overlap-{c_overlap}_final.pkl", "wb") as f:
             pickle.dump(techqa_embed_final, f)
+            
+            
+        # Load embeddings
+        with open(f"techqa_embeddings/Snowflake/size-{c_size}_overlap-{c_overlap}_final.pkl", "rb") as f:
+            techqa_embed_final = pickle.load(f)
             
         results_list = []
         for i, query in tqdm(enumerate(techqa.question), total=len(techqa.question), desc="Processing queries"):
@@ -770,7 +702,7 @@ for c_size in chunk_size:
             results_list.append(full_results)
             
         # Save
-        with open(f"techqa_results/Snowflake/results_list_size-{c_size}_overlap-{c_overlap}.pkl", "wb") as f:
+        with open(f"techqa_results/Snowflake/gte-cross-encoder_results_list_size-{c_size}_overlap-{c_overlap}.pkl", "wb") as f:
             pickle.dump(results_list, f)
         
         
@@ -788,13 +720,22 @@ for c_size in chunk_size:
 
 ########## BENCHMARK TECHQA ##########
 # Compute recall mean, ignore nan's
-results_list = pickle.load(open("techqa_results/BGE-M3/results_list_bge_size-4000_overlap-100.pkl", "rb"))
+results_list = pickle.load(open("techqa_results/Snowflake/gte-cross-encoder_results_list_size-1024_overlap-0.pkl", "rb"))
 recall_mean, recalls = compute_recall(results_list)
 print(f"Recall mean: {recall_mean}")
 
+# Plot BGE, JINA, MXBAI, NOMIC and Snowflake results together (1024, 2048, 4096)
+# Load results
+# Plot results
+
+
 overlap_0_results = np.array([])
 overlap_100_results = np.array([])
-for results_file in natsorted(Path("techqa_results/BGE-M3").glob("results_list_bge_*.pkl")):
+for results_file in natsorted(Path("techqa_results/BGE-M3").glob("results_list_bge_size-*_overlap-*.pkl")):
+    # skip if 8000
+    if "8000" in str(results_file):
+        continue
+    
     results_list = pickle.load(open(results_file, "rb"))
     recall_mean, recalls = compute_recall(results_list)
     if "overlap-0" in str(results_file):
@@ -802,7 +743,7 @@ for results_file in natsorted(Path("techqa_results/BGE-M3").glob("results_list_b
     else:
         overlap_100_results = np.append(overlap_100_results, recall_mean)
         
-results_df = pd.DataFrame({"chunk_size": ["500", "750", "1000", "1250", "1500", "1750", "2000", "2500", "3000", "4000", "8000"],
+results_df = pd.DataFrame({"chunk_size": ["1024", "2048", "4096"],
                            "overlap_0": overlap_0_results,
                            "overlap_100": overlap_100_results})
 
@@ -817,17 +758,24 @@ ax.set_xlabel("Chunk size")
 ax.set_xticklabels(ax.get_xticklabels(), rotation=45)
 ax.set_ylabel("Recall (%)")
 ax.set_ylim(0, 70)
-# Add vertical line between 1000 and 1250 (AnythingLLM chunk size limit)
-x_ticks = ax.get_xticks()
-x_labels = [label.get_text() for label in ax.get_xticklabels()]
-idx_1000 = x_labels.index("1000")
-idx_1250 = x_labels.index("1250")
-line_x = (x_ticks[idx_1000] + x_ticks[idx_1250]) / 2
-ax.axvline(x=line_x, color='red', linestyle='--')
-ax.text(line_x + 0.1, 45, "AnythingLLM chunk size limit", rotation=90, color='red')
+
+# add title
+ax.set_title("BGE-M3")
+# Show max recall value in the plot
+max_recall = results_df["recall"].max()
+ax.text(results_df.loc[results_df["recall"] == max_recall, "chunk_size"].values[0], max_recall + 5, f"{max_recall:.2f}%", ha="center", va="bottom")
+
+# # Add vertical line between 1000 and 1250 (AnythingLLM chunk size limit)
+# x_ticks = ax.get_xticks()
+# x_labels = [label.get_text() for label in ax.get_xticklabels()]
+# idx_1000 = x_labels.index("1000")
+# idx_1250 = x_labels.index("1250")
+# line_x = (x_ticks[idx_1000] + x_ticks[idx_1250]) / 2
+# ax.axvline(x=line_x, color='red', linestyle='--')
+# ax.text(line_x + 0.1, 45, "AnythingLLM chunk size limit", rotation=90, color='red')
 
 # Save plot as pdf
-plt.savefig(f"recall_barplot_bge-m3.pdf", dpi=300)
+plt.savefig(f"recall_barplot_BGE-M3.pdf", dpi=300)
 
 
 print(f"Overlap 0 recalls:   {', '.join([f'{x:.2f}%' for x in np.round(overlap_0_results, 4)*100])}")
@@ -840,154 +788,154 @@ print(f"Overlap 100 recalls: {', '.join([f'{x:.2f}%' for x in np.round(overlap_1
 
 
 
-# # test 1: big chunk, small sentence, small irrelevant start, should pass
-# chunk = 'IBM Support Portal [http://www.ibm.com/support] Machine Code License and Licensed Internal Code [http://www.ibm.com/support/docview.wss?uid=isg3T1025362] Machine warranties and license information [http://www.ibm.com/support/docview.wss?uid=isg3T1025361] International Warranty Service [http://www.ibm.com/support/docview.wss?uid=isg3T1025366] Advanced Part Exchange Warranty Service [http://www.ibm.com/support/docview.wss?uid=isg3T1025367] Authorized Use Table [http://www.ibm.com/support/docview.wss?uid=isg3T1025368] Environmental notices [http://www.ibm.com/support/docview.wss?uid=isg3T1025370] Install Policy [http://www.ibm.com/support/docview.wss?uid=isg3T1025365] Terms by product [http://www.ibm.com/support/docview.wss?uid=isg3T1025369] FAQs [http://www.ibm.com/support/docview.wss?uid=isg3T1025364] Glossary [http://www.ibm.com/support/docview.wss?uid=isg3T1025363] [data:image/gif;base64,R0lGODlhEAABAPAAAAAAAP///yH5BAEAAAEALAAAAAAQAAEAQAIEjI8ZBQA7]'
-# test = "irrelevant text IBM Support Portal [http://www.ibm.com/support] Machine Code License"
+# # # test 1: big chunk, small sentence, small irrelevant start, should pass
+# # chunk = 'IBM Support Portal [http://www.ibm.com/support] Machine Code License and Licensed Internal Code [http://www.ibm.com/support/docview.wss?uid=isg3T1025362] Machine warranties and license information [http://www.ibm.com/support/docview.wss?uid=isg3T1025361] International Warranty Service [http://www.ibm.com/support/docview.wss?uid=isg3T1025366] Advanced Part Exchange Warranty Service [http://www.ibm.com/support/docview.wss?uid=isg3T1025367] Authorized Use Table [http://www.ibm.com/support/docview.wss?uid=isg3T1025368] Environmental notices [http://www.ibm.com/support/docview.wss?uid=isg3T1025370] Install Policy [http://www.ibm.com/support/docview.wss?uid=isg3T1025365] Terms by product [http://www.ibm.com/support/docview.wss?uid=isg3T1025369] FAQs [http://www.ibm.com/support/docview.wss?uid=isg3T1025364] Glossary [http://www.ibm.com/support/docview.wss?uid=isg3T1025363] [data:image/gif;base64,R0lGODlhEAABAPAAAAAAAP///yH5BAEAAAEALAAAAAAQAAEAQAIEjI8ZBQA7]'
+# # test = "irrelevant text IBM Support Portal [http://www.ibm.com/support] Machine Code License"
     
-# s = difflib.SequenceMatcher(None,
-#                             chunk,
-#                             test)
+# # s = difflib.SequenceMatcher(None,
+# #                             chunk,
+# #                             test)
 
-# pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
-# print(pos_a, pos_b, size)
-# print(pos_a+size, pos_b+size)
-# print(len(chunk), len(test))
+# # pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
+# # print(pos_a, pos_b, size)
+# # print(pos_a+size, pos_b+size)
+# # print(len(chunk), len(test))
 
-# print(chunk[pos_a:pos_a+size])
-# print(test[pos_b:pos_b+size])
+# # print(chunk[pos_a:pos_a+size])
+# # print(test[pos_b:pos_b+size])
 
-# s.ratio()
+# # s.ratio()
 
-# # test 2: big chunk, small sentence, irrelevant start and end (middle matches only), should fail
-# chunk = chunk
-# test = "irrelevant text Support Portal [http://www.ibm.com/support] Machine Code License irrelevant text"
+# # # test 2: big chunk, small sentence, irrelevant start and end (middle matches only), should fail
+# # chunk = chunk
+# # test = "irrelevant text Support Portal [http://www.ibm.com/support] Machine Code License irrelevant text"
 
-# s = difflib.SequenceMatcher(None,
-#                             chunk,
-#                             test)
+# # s = difflib.SequenceMatcher(None,
+# #                             chunk,
+# #                             test)
 
-# pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
-# print(pos_a, pos_b, size)
-# print(pos_a+size, pos_b+size)
-# print(len(chunk), len(test))
+# # pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
+# # print(pos_a, pos_b, size)
+# # print(pos_a+size, pos_b+size)
+# # print(len(chunk), len(test))
 
-# print(chunk[pos_a:pos_a+size])
-# print(test[pos_b:pos_b+size])
+# # print(chunk[pos_a:pos_a+size])
+# # print(test[pos_b:pos_b+size])
 
-# matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
-# print(matching_ratio)
+# # matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
+# # print(matching_ratio)
 
-# # test 3: big chunk, small sentence, contained within, should pass
-# chunk = chunk
-# test = "[http://www.ibm.com/support] Machine Code License and Licensed Internal"
+# # # test 3: big chunk, small sentence, contained within, should pass
+# # chunk = chunk
+# # test = "[http://www.ibm.com/support] Machine Code License and Licensed Internal"
 
-# s = difflib.SequenceMatcher(None,
-#                             chunk,
-#                             test)
+# # s = difflib.SequenceMatcher(None,
+# #                             chunk,
+# #                             test)
 
-# pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
-# print(pos_a, pos_b, size)
-# print(pos_a+size, pos_b+size)
-# print(len(chunk), len(test))
+# # pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
+# # print(pos_a, pos_b, size)
+# # print(pos_a+size, pos_b+size)
+# # print(len(chunk), len(test))
 
-# print(chunk[pos_a:pos_a+size])
-# print(test[pos_b:pos_b+size])
+# # print(chunk[pos_a:pos_a+size])
+# # print(test[pos_b:pos_b+size])
 
-# matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
-# print(matching_ratio)
+# # matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
+# # print(matching_ratio)
 
-# # test 4: big chunk, small sentence, small irrelevant end, should pass
-# chunk = chunk
-# test = "[data:image/gif;base64,R0lGODlhEAABAPAAAAAAAP///yH5BAEAAAEALAAAAAAQAAEAQAIEjI8ZBQA7] small irrelevant end"
+# # # test 4: big chunk, small sentence, small irrelevant end, should pass
+# # chunk = chunk
+# # test = "[data:image/gif;base64,R0lGODlhEAABAPAAAAAAAP///yH5BAEAAAEALAAAAAAQAAEAQAIEjI8ZBQA7] small irrelevant end"
 
-# s = difflib.SequenceMatcher(None,
-#                             chunk,
-#                             test)
+# # s = difflib.SequenceMatcher(None,
+# #                             chunk,
+# #                             test)
 
-# pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
-# print(pos_a, pos_b, size)
-# print(pos_a+size, pos_b+size)
-# print(len(chunk), len(test))
+# # pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
+# # print(pos_a, pos_b, size)
+# # print(pos_a+size, pos_b+size)
+# # print(len(chunk), len(test))
 
-# print(chunk[pos_a:pos_a+size])
-# print(test[pos_b:pos_b+size])
+# # print(chunk[pos_a:pos_a+size])
+# # print(test[pos_b:pos_b+size])
 
-# matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
-# print(matching_ratio)
+# # matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
+# # print(matching_ratio)
 
-# # test 5: big chunk, bigger sentence, small irrelevant start andend, should pass
-# chunk = chunk
-# test = "irrelevant text " + chunk + " more irrelevant text"
+# # # test 5: big chunk, bigger sentence, small irrelevant start andend, should pass
+# # chunk = chunk
+# # test = "irrelevant text " + chunk + " more irrelevant text"
 
-# s = difflib.SequenceMatcher(None,
-#                             chunk,
-#                             test)
+# # s = difflib.SequenceMatcher(None,
+# #                             chunk,
+# #                             test)
 
-# pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
-# print(pos_a, pos_b, size)
-# print(pos_a+size, pos_b+size)
-# print(len(chunk), len(test))
+# # pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
+# # print(pos_a, pos_b, size)
+# # print(pos_a+size, pos_b+size)
+# # print(len(chunk), len(test))
 
-# print(chunk[pos_a:pos_a+size])
-# print(test[pos_b:pos_b+size])
+# # print(chunk[pos_a:pos_a+size])
+# # print(test[pos_b:pos_b+size])
 
-# matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
-# print(matching_ratio)
+# # matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
+# # print(matching_ratio)
 
-# # test 6: big chunk, small sentence, big irrelevant end, should fail
-# chunk = chunk
-# test = "[data:image/gif;base64,R0lGODlhEAABAPAAAAAAAP///yH5BAEAAAEALAAAAAAQAAEAQAIEjI8ZBQA7] big irrelevant end big irrelevant end big irrelevant end big irrelevant end big irrelevant end big irrelevant end big irrelevant end"
+# # # test 6: big chunk, small sentence, big irrelevant end, should fail
+# # chunk = chunk
+# # test = "[data:image/gif;base64,R0lGODlhEAABAPAAAAAAAP///yH5BAEAAAEALAAAAAAQAAEAQAIEjI8ZBQA7] big irrelevant end big irrelevant end big irrelevant end big irrelevant end big irrelevant end big irrelevant end big irrelevant end"
 
-# s = difflib.SequenceMatcher(None,
-#                             chunk,
-#                             test)
+# # s = difflib.SequenceMatcher(None,
+# #                             chunk,
+# #                             test)
 
-# pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
-# print(pos_a, pos_b, size)
-# print(pos_a+size, pos_b+size)
-# print(len(chunk), len(test))
+# # pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
+# # print(pos_a, pos_b, size)
+# # print(pos_a+size, pos_b+size)
+# # print(len(chunk), len(test))
 
-# print(chunk[pos_a:pos_a+size])
-# print(test[pos_b:pos_b+size])
+# # print(chunk[pos_a:pos_a+size])
+# # print(test[pos_b:pos_b+size])
 
-# matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
-# print(matching_ratio)
+# # matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
+# # print(matching_ratio)
 
-# # test 7: big chunk, small sentence, totally irrelevant, should fail
-# chunk = chunk
-# test = "totally irrelevant text IBM not"
+# # # test 7: big chunk, small sentence, totally irrelevant, should fail
+# # chunk = chunk
+# # test = "totally irrelevant text IBM not"
 
-# s = difflib.SequenceMatcher(None,
-#                             chunk,
-#                             test)
+# # s = difflib.SequenceMatcher(None,
+# #                             chunk,
+# #                             test)
 
-# pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
-# print(pos_a, pos_b, size)
-# print(pos_a+size, pos_b+size)
-# print(len(chunk), len(test))
+# # pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
+# # print(pos_a, pos_b, size)
+# # print(pos_a+size, pos_b+size)
+# # print(len(chunk), len(test))
 
-# print(chunk[pos_a:pos_a+size])
-# print(test[pos_b:pos_b+size])
+# # print(chunk[pos_a:pos_a+size])
+# # print(test[pos_b:pos_b+size])
 
-# matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
-# print(matching_ratio)
+# # matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
+# # print(matching_ratio)
 
-# # test 8: small chunk, big sentence, big irrelevant start and end, should pass
-# chunk = "ssss small chunk"
-# test = "really really irrelevant text small chunk more really really irrelevant text"
+# # # test 8: small chunk, big sentence, big irrelevant start and end, should pass
+# # chunk = "ssss small chunk"
+# # test = "really really irrelevant text small chunk more really really irrelevant text"
 
-# s = difflib.SequenceMatcher(None,
-#                             chunk,
-#                             test)
+# # s = difflib.SequenceMatcher(None,
+# #                             chunk,
+# #                             test)
 
-# pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
+# # pos_a, pos_b, size = s.find_longest_match(0, len(chunk), 0, len(test))
 
-# print(pos_a, pos_b, size)
-# print(pos_a+size, pos_b+size)
-# print(len(chunk), len(test))
+# # print(pos_a, pos_b, size)
+# # print(pos_a+size, pos_b+size)
+# # print(len(chunk), len(test))
 
-# print(chunk[pos_a:pos_a+size])
-# print(test[pos_b:pos_b+size])
+# # print(chunk[pos_a:pos_a+size])
+# # print(test[pos_b:pos_b+size])
 
-# matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
-# print(matching_ratio)
+# # matching_ratio = len(chunk[pos_a:pos_a+size]) / len(test)
+# # print(matching_ratio)
