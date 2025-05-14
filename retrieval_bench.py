@@ -327,7 +327,7 @@ def quick_test(bi_encoder, cross_encoder, pdf_processor, doc_path, query, top_k=
     print(results_df)
     
     
-def retrieve_and_rerank(queries, embeddings, bi_encoder, cross_encoder, dataset, top_k=50, save_results=False, save_path=None):
+def retrieve_and_rerank(queries, embeddings, bi_encoder, cross_encoder, dataset, top_k=50, top_n=4, save_results=False, save_path=None):
     """
     Retrieves and reranks chunks for a list of queries.
     
@@ -351,7 +351,7 @@ def retrieve_and_rerank(queries, embeddings, bi_encoder, cross_encoder, dataset,
     results_list = []
     for i, query in tqdm(enumerate(queries), total=len(queries), desc="Processing queries"):
         top_chunks = bi_encoder.retrieve_top_k(query, embeddings, top_k=top_k)  # Retrieve top chunks for each query
-        reranked_results = cross_encoder.rerank(query, top_chunks)  # Rerank the chunks
+        reranked_results = cross_encoder.rerank(query, top_chunks, top_n=top_n)  # Rerank the chunks
         reranked_results = [{k: v for k, v in d.items() if k not in ["vector", "match_types"]} for d in reranked_results]
         
         expected_sentences = dataset.loc[i, "all_relevant_sentence_keys"]
@@ -451,7 +451,9 @@ def compute_recall(results_list):
 # Pipeline initialization
 # pdf_processor = PdfProcessor()
 # bi_encoder = BiEncoderPipeline()
-cross_encoder = CrossEncoderPipeline(model_name="Alibaba-NLP/gte-reranker-modernbert-base")
+# cross_encoder = CrossEncoderPipeline(model_name="Alibaba-NLP/gte-reranker-modernbert-base")
+cross_encoder = CrossEncoderPipeline()
+
 
 
 ##################### TECHQA #####################
@@ -540,14 +542,11 @@ with open("techqa_exp.pkl", "rb") as f:
 #     techqa_embed = pickle.load(f)
 
 techqa_questions = techqa.question.tolist()
-chunk_size = [4096, 8192]
+chunk_size = [1024, 2048, 4096]
 chunk_overlap = [0, 128]
 for c_size in chunk_size:
     for c_overlap in chunk_overlap:
         print(f"c_size: {c_size}, c_overlap: {c_overlap}")
-        
-        # if c_size == 1024 and c_overlap == 0:
-        #     continue
         
         bi_encoder_text_embedding = BiEncoderPipeline(
             model_name="Snowflake/snowflake-arctic-embed-l-v2.0",
@@ -557,6 +556,10 @@ for c_size in chunk_size:
         
         techqa_embed = bi_encoder_text_embedding.embed_documents(techqa_exp.documents.to_list(),
                                                                  techqa_exp.doc_id.to_list())
+        
+        # Save embeddings
+        with open(f"techqa_embeddings/Snowflake/size{c_size}/overlap{c_overlap}/embeddings.pkl", "wb") as f:
+            pickle.dump(techqa_embed, f)
         
         wiggle_room = 1 if c_overlap > 0 else 0
         previous_doc_idx = None
@@ -679,18 +682,18 @@ for c_size in chunk_size:
                     
                     
         techqa_embed_final = techqa_embed
-        with open(f"techqa_embeddings/Snowflake/size-{c_size}_overlap-{c_overlap}_final.pkl", "wb") as f:
+        with open(f"techqa_embeddings/Snowflake/size{c_size}/overlap{c_overlap}/embeddings_final.pkl", "wb") as f:
             pickle.dump(techqa_embed_final, f)
             
             
         # Load embeddings
-        with open(f"techqa_embeddings/Snowflake/size-{c_size}_overlap-{c_overlap}_final.pkl", "rb") as f:
+        with open(f"techqa_embeddings/Snowflake/size{c_size}/overlap{c_overlap}/embeddings_final.pkl", "rb") as f:
             techqa_embed_final = pickle.load(f)
             
         results_list = []
         for i, query in tqdm(enumerate(techqa.question), total=len(techqa.question), desc="Processing queries"):
             top_chunks = bi_encoder_text_embedding.retrieve_top_k(query, techqa_embed_final, top_k=50) # Retrieve top 50 chunks for eachq query
-            reranked_results = cross_encoder.rerank(query, top_chunks) # Rerank the chunks
+            reranked_results = cross_encoder.rerank(query, top_chunks, top_n=16) # Rerank the chunks
             reranked_results = [{k: v for k, v in d.items() if k not in ["vector", "match_types"]} for d in reranked_results]
             
             expected_sentences = techqa.loc[i, "all_relevant_sentence_keys"]
@@ -702,7 +705,7 @@ for c_size in chunk_size:
             results_list.append(full_results)
             
         # Save
-        with open(f"techqa_results/Snowflake/gte-cross-encoder_results_list_size-{c_size}_overlap-{c_overlap}.pkl", "wb") as f:
+        with open(f"techqa_results/Snowflake/size{c_size}/overlap{c_overlap}/miniLM-L6-v2/topn16/results.pkl", "wb") as f:
             pickle.dump(results_list, f)
         
         
