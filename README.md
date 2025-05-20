@@ -36,9 +36,7 @@ Key components:
 ## Key Files
 
 - `retrieval_bench.py`: Core benchmarking for retrieval pipeline components
-- `generation_bench.py`: Evaluates LLM response quality based on retrieved contexts
-- `new_cross_test.py`: Implementation of alternative reranking methods
-- `environment.yml`: Conda environment configuration with required dependencies
+- `generation_bench.py`: Evaluates LLM response quality based on retrieved context
 
 ## Dataset
 
