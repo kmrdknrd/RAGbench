@@ -179,11 +179,11 @@ results_list_test_path = "tests/order/snowflake_2048_128_8.pkl"
 results_list = pickle.load(open(results_list_test_path, "rb"))
 
 random.seed(42)
-results_list_sample_5 = random.sample(results_list, 5)
+results_list_sample = random.sample(results_list, 100)
 
 # save the sample
-results_list_sample_5_path = "tests/order/snowflake_2048_128_8_sample_5.pkl"
-pickle.dump(results_list_sample_5, open(results_list_sample_5_path, "wb"))
+results_list_sample_path = "tests/order/snowflake_2048_128_8_sample.pkl"
+pickle.dump(results_list_sample, open(results_list_sample_path, "wb"))
 
 context_conditions = [True, False]
 order_conditions = ["instructions", "context", "query"]
@@ -200,7 +200,7 @@ model_name = "cogito:3b"
 for order_condition in all_order_conditions:
     for context_condition in context_conditions:
         print(f"Order condition: {order_condition}, Context ascending: {context_condition}")
-        results_list = response_generation(results_list_sample_5_path, model_name, first=order_condition[0], second=order_condition[1], context_asc=context_condition)
+        results_list = response_generation(results_list_sample_path, model_name, first=order_condition[0], second=order_condition[1], context_asc=context_condition)
 
 for order_condition in all_order_conditions:
     for context_condition in context_conditions:
