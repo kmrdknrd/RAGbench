@@ -3,6 +3,10 @@ import json
 import os
 import asyncio
 import random
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from pathlib import Path
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from ragas.dataset_schema import SingleTurnSample
@@ -106,8 +110,7 @@ def response_generation(results_list_llm_path, model_name, first="instructions",
                 {context}
                 {instructions}
                 """
-        
-        print(rag_prompt)
+    
         
         response = llm.invoke(rag_prompt)
         results_list[i][model_name] = {
@@ -175,15 +178,15 @@ async def evaluate_responses(results_list, results_list_path, model_name):
 
 ## Generation and evaluation
 # Process all queries in the results list
-results_list_test_path = "tests/order/snowflake_2048_128_8.pkl"
-results_list = pickle.load(open(results_list_test_path, "rb"))
+# results_list_test_path = "tests/order/snowflake_2048_128_8.pkl"
+# results_list = pickle.load(open(results_list_test_path, "rb"))
 
-random.seed(42)
-results_list_sample = random.sample(results_list, 100)
+# random.seed(42)
+# results_list_sample = random.sample(results_list, 100)
 
-# save the sample
 results_list_sample_path = "tests/order/snowflake_2048_128_8_sample.pkl"
-pickle.dump(results_list_sample, open(results_list_sample_path, "wb"))
+# pickle.dump(results_list_sample, open(results_list_sample_path, "wb"))
+results_list_sample = pickle.load(open(results_list_sample_path, "rb"))
 
 context_conditions = [True, False]
 order_conditions = ["instructions", "context", "query"]
@@ -197,58 +200,117 @@ all_order_conditions = [
 ]
 
 model_name = "cogito:3b"
-for order_condition in all_order_conditions:
-    for context_condition in context_conditions:
-        print(f"Order condition: {order_condition}, Context ascending: {context_condition}")
-        results_list = response_generation(results_list_sample_path, model_name, first=order_condition[0], second=order_condition[1], context_asc=context_condition)
+# for order_condition in all_order_conditions:
+#     for context_condition in context_conditions:
+#         print(f"Order condition: {order_condition}, Context ascending: {context_condition}")
+#         results_list = response_generation(results_list_sample_path, model_name, first=order_condition[0], second=order_condition[1], context_asc=context_condition)
 
-for order_condition in all_order_conditions:
-    for context_condition in context_conditions:
-        print(f"Order condition: {order_condition}, Context ascending: {context_condition}")
-        context_condition_path = "context_asc" if context_condition else "context_desc"
+# for order_condition in all_order_conditions:
+#     for context_condition in context_conditions:
+#         print(f"Order condition: {order_condition}, Context ascending: {context_condition}")
+#         context_condition_path = "context_asc" if context_condition else "context_desc"
         
-        results_list_path = f"tests/order/{order_condition[0]}/{order_condition[1]}/{context_condition_path}/results.pkl"
-        results_list = pickle.load(open(results_list_path, "rb"))
-        asyncio.run(evaluate_responses(results_list, results_list_path, model_name))
+#         results_list_path = f"tests/order/{order_condition[0]}/{order_condition[1]}/{context_condition_path}/results.pkl"
+#         results_list = pickle.load(open(results_list_path, "rb"))
+#         asyncio.run(evaluate_responses(results_list, results_list_path, model_name))
 
+
+## Plotting    
+# Create bar plot of the instructions, context and query combination (i.e., all_order_conditions[0]) (both ascending and descending bars)
+def plot_condition_results(condition, model_name, y_lim_groundedness=None, y_lim_relevancy=None):
+    """
+    Create bar plots comparing ascending and descending context order for a given condition.
     
-
-
-
-
-# Run the async evaluation
-results_list = pickle.load(open(results_list_test_path, "rb"))
-
-
-
-
-# asyncio.run(evaluate_responses(results_list, model_name))
-
-# # Get the average scores for the groundedness and relevancy scores
-# groundedness_scores = np.array([result[model_name]["groundedness_score"] for result in results_list if result[model_name]["groundedness_score"] is not None])
-# relevancy_scores = np.array([result[model_name]["relevancy_score"] for result in results_list if result[model_name]["relevancy_score"] is not None])
-
-# print(f"Average groundedness score: {groundedness_scores.mean()}")
-# print(f"Average relevancy score: {relevancy_scores.mean()}")
-
-# # # Restructure the results_list dictionaries
-# # for result in results_list:
-# #     # Create the granite dictionary with the specified keys
-# #     llm_results = {
-# #         'llm_response': result['llm_response'],
-# #         'groundedness_score': result['groundedness_score'],
-# #         'relevancy_score': result['relevancy_score'],
-# #         'scored': result['scored']
-# #     }
+    Args:
+        condition: Tuple of (first, second, third) order elements
+        model_name: Name of the model used for evaluation
     
-# #     # Remove the old keys
-# #     del result['llm_response']
-# #     del result['groundedness_score']
-# #     del result['relevancy_score']
-# #     del result['scored']
-    
-# #     # Add the dictionary
-# #     result[model_name] = llm_results
+    Returns:
+        fig: The matplotlib figure object containing the plots
+    """
+    results_asc_path = Path(f"tests/order/{condition[0]}/{condition[1]}/context_asc/results_scored.pkl")
+    results_desc_path = Path(f"tests/order/{condition[0]}/{condition[1]}/context_desc/results_scored.pkl")
 
-# # # Save the restructured results
-# # pickle.dump(results_list, open(results_list_llm_path, "wb"))
+    results_asc = pickle.load(open(results_asc_path, "rb"))
+    results_desc = pickle.load(open(results_desc_path, "rb"))
+
+    # Get the groundedness and relevancy scores for the ascending and descending results (ignore None and nan values)
+    groundedness_asc_mean = np.mean([result[model_name]["groundedness_score"] for result in results_asc if result[model_name]["groundedness_score"] is not None and not np.isnan(result[model_name]["groundedness_score"])])
+    groundedness_desc_mean = np.mean([result[model_name]["groundedness_score"] for result in results_desc if result[model_name]["groundedness_score"] is not None and not np.isnan(result[model_name]["groundedness_score"])])
+    relevancy_asc_mean = np.mean([result[model_name]["relevancy_score"] for result in results_asc if result[model_name]["relevancy_score"] is not None and not np.isnan(result[model_name]["relevancy_score"])])
+    relevancy_desc_mean = np.mean([result[model_name]["relevancy_score"] for result in results_desc if result[model_name]["relevancy_score"] is not None and not np.isnan(result[model_name]["relevancy_score"])])
+
+    # Create a bar plot of the groundedness and relevancy scores for the ascending and descending results
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+    # Create DataFrames for each metric
+    groundedness_data = pd.DataFrame({
+        'Order': ['Ascending', 'Descending'],
+        'Score': [groundedness_asc_mean, groundedness_desc_mean]
+    })
+
+    relevancy_data = pd.DataFrame({
+        'Order': ['Ascending', 'Descending'],
+        'Score': [relevancy_asc_mean, relevancy_desc_mean]
+    })
+
+    # Plot groundedness
+    sns.barplot(x='Order', y='Score', data=groundedness_data, ax=ax1, palette="viridis")
+    ax1.set_xlabel("Order")
+    ax1.set_ylabel("Score")
+    ax1.set_title("Groundedness")
+
+    # Plot relevancy
+    sns.barplot(x='Order', y='Score', data=relevancy_data, ax=ax2, palette="viridis")
+    ax2.set_xlabel("Order")
+    ax2.set_ylabel("Score")
+    ax2.set_title("Relevancy")
+    
+    if y_lim_groundedness:
+        ax1.set_ylim(0, y_lim_groundedness)
+    if y_lim_relevancy:
+        ax2.set_ylim(0, y_lim_relevancy)
+
+    # Add a title for the whole plot
+    fig.suptitle(f"{condition[0].capitalize()} > {condition[1].capitalize()} > {condition[2].capitalize()}", fontsize=16)
+    plt.tight_layout()
+    
+    return fig
+
+condition = all_order_conditions[0]
+model_name = "cogito:3b"
+
+all_figures = []
+
+# find max y-value for all figures
+maxgroundedness = 0
+maxrelevancy = 0
+for condition in all_order_conditions:
+    results_asc_path = Path(f"tests/order/{condition[0]}/{condition[1]}/context_asc/results_scored.pkl")
+    results_desc_path = Path(f"tests/order/{condition[0]}/{condition[1]}/context_desc/results_scored.pkl")
+    
+    results_asc = pickle.load(open(results_asc_path, "rb"))
+    results_desc = pickle.load(open(results_desc_path, "rb"))
+    
+    # Get the groundedness and relevancy scores for the ascending and descending results (ignore None and nan values)
+    groundedness_asc_mean = np.mean([result[model_name]["groundedness_score"] for result in results_asc if result[model_name]["groundedness_score"] is not None and not np.isnan(result[model_name]["groundedness_score"])])
+    groundedness_desc_mean = np.mean([result[model_name]["groundedness_score"] for result in results_desc if result[model_name]["groundedness_score"] is not None and not np.isnan(result[model_name]["groundedness_score"])])
+    relevancy_asc_mean = np.mean([result[model_name]["relevancy_score"] for result in results_asc if result[model_name]["relevancy_score"] is not None and not np.isnan(result[model_name]["relevancy_score"])])
+    relevancy_desc_mean = np.mean([result[model_name]["relevancy_score"] for result in results_desc if result[model_name]["relevancy_score"] is not None and not np.isnan(result[model_name]["relevancy_score"])])
+    
+    if groundedness_asc_mean > maxgroundedness:
+        maxgroundedness = groundedness_asc_mean
+    if groundedness_desc_mean > maxgroundedness:
+        maxgroundedness = groundedness_desc_mean
+    if relevancy_asc_mean > maxrelevancy:
+        maxrelevancy = relevancy_asc_mean   
+    if relevancy_desc_mean > maxrelevancy:
+        maxrelevancy = relevancy_desc_mean
+        
+
+for condition in all_order_conditions:
+    fig = plot_condition_results(condition, model_name, y_lim_groundedness=maxgroundedness * 1.1, y_lim_relevancy=maxrelevancy * 1.1)
+    all_figures.append(fig)
+
+
+
