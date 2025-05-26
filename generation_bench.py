@@ -35,13 +35,9 @@ def response_generation(results_list_llm_path, model_name):
         query = result["query"]
         context_ids = [entry["original_doc_id"] for entry in result["results"]]
         context_texts = [entry["text"] for entry in result["results"]]
-        context_texts_pretty = "\n".join([f"<DOCUMENT{i+1}>\nID: {context_ids[i]}\nTEXT:\n{text}\n</DOCUMENT{i+1}>\n" for i, text in enumerate(context_texts)])
+        context_texts_pretty = "\n".join([f"<DOCUMENT{i+1}: {context_ids[i]}>\nTEXT:\n{text}\n</DOCUMENT{i+1}: {context_ids[i]}>\n" for i, text in enumerate(context_texts)])
         
-        rag_prompt = f"""
-        <DOCUMENTS>
-        {context_texts_pretty}
-        </DOCUMENTS>
-        
+        rag_prompt = f"""        
         <QUERY>
         {query}
         </QUERY>
@@ -49,8 +45,13 @@ def response_generation(results_list_llm_path, model_name):
         <INSTRUCTIONS>
         Answer the user's QUERY using the DOCUMENTS text above.
         Keep your answer grounded in the facts of the DOCUMENTS.
+        Use the IDs of the DOCUMENTS in your response.
         If the DOCUMENTS don't contain the facts to answer the QUERY, your best response is "the materials do not appear to be sufficient to provide a good answer."
         </INSTRUCTIONS>
+        
+        <DOCUMENTS>
+        {context_texts_pretty}
+        </DOCUMENTS>
         """
         
         response = llm.invoke(rag_prompt)
@@ -66,10 +67,10 @@ def response_generation(results_list_llm_path, model_name):
         
     return results_list
      
-async def evaluate_responses():
+async def evaluate_responses(results_list, model_name):
     # Initialize the embedder and evaluator
-    embedder = OllamaEmbeddings(model="snowflake-arctic-embed")
-    evaluator_model_name = "qwen3:0.6b"
+    embedder = OllamaEmbeddings(model="snowflake-arctic-embed2")
+    evaluator_model_name = "gemma3:1b"
     evaluator_llm = LangchainLLMWrapper(ChatOllama(model=evaluator_model_name))
     
     # Initialize the groundedness and relevancy scorers
@@ -78,9 +79,9 @@ async def evaluate_responses():
     
     # Evaluate the LLM responses
     for i, result in tqdm(enumerate(results_list), total=len(results_list), desc="Evaluating LLM responses"):
-        # if "scored" in result[model_name]:
-        #     print(f"Skipping query {i} because its response has already been scored")
-        #     continue
+        if "scored" in result[model_name]:
+            print(f"Skipping query {i} because its response has already been scored")
+            continue
         
         response = result[model_name]["llm_response"]
 
@@ -114,16 +115,17 @@ async def evaluate_responses():
 
 ## Generation and evaluation
 # Process all queries in the results list
-results_list_llm_path = "techqa_results/Snowflake/size4096/overlap128/miniLM-L6-v2/topn16/results_llm.pkl"
-model_name = "gemma3:1b"
+results_list_llm_path = "techqa_results/Snowflake/size4096/overlap128/miniLM-L6-v2/topn4/results_llm.pkl"
+model_name = "qwen3:1.7b"
 results_list = response_generation(results_list_llm_path, model_name)
 
 # Run the async evaluation
-asyncio.run(evaluate_responses())
+results_list = pickle.load(open(results_list_llm_path, "rb"))
+asyncio.run(evaluate_responses(results_list, model_name))
 
 # Get the average scores for the groundedness and relevancy scores
-groundedness_scores = np.array([result[model_name]["groundedness_score"] for result in results_list])
-relevancy_scores = np.array([result[model_name]["relevancy_score"] for result in results_list])
+groundedness_scores = np.array([result[model_name]["groundedness_score"] for result in results_list if result[model_name]["groundedness_score"] is not None])
+relevancy_scores = np.array([result[model_name]["relevancy_score"] for result in results_list if result[model_name]["relevancy_score"] is not None])
 
 print(f"Average groundedness score: {groundedness_scores.mean()}")
 print(f"Average relevancy score: {relevancy_scores.mean()}")
@@ -149,3 +151,33 @@ print(f"Average relevancy score: {relevancy_scores.mean()}")
 
 # # Save the restructured results
 # pickle.dump(results_list, open(results_list_llm_path, "wb"))
+
+
+# Get the average scores for the groundedness and relevancy scores (skip index 231)
+groundedness_scores = np.array([result["cogito:3b"]["groundedness_score"] for result in results_list if result["cogito:3b"]["groundedness_score"] is not None])
+relevancy_scores = np.array([result["cogito:3b"]["relevancy_score"] for result in results_list if result["cogito:3b"]["relevancy_score"] is not None])
+
+print(f"Average groundedness score: {groundedness_scores.mean()}")
+print(f"Average relevancy score: {relevancy_scores.mean()}")
+
+for i, result in enumerate(results_list):
+    print(result["cogito:3b"]["groundedness_score"])
+
+
+
+# Get the average scores for the groundedness and relevancy scores
+groundedness_scores = np.array([result["cogito:8b"]["groundedness_score"] for result in results_list if result["cogito:8b"]["groundedness_score"] is not None])
+relevancy_scores = np.array([result["cogito:8b"]["relevancy_score"] for result in results_list if result["cogito:8b"]["relevancy_score"] is not None])
+
+print(f"Average groundedness score: {groundedness_scores.mean()}")
+print(f"Average relevancy score: {relevancy_scores.mean()}")
+
+
+
+
+# Get the average scores for the groundedness and relevancy scores
+groundedness_scores = np.array([result["llama3.2:latest"]["groundedness_score"] for result in results_list if result["llama3.2:latest"]["groundedness_score"] is not None])
+relevancy_scores = np.array([result["llama3.2:latest"]["relevancy_score"] for result in results_list if result["llama3.2:latest"]["relevancy_score"] is not None])
+
+print(f"Average groundedness score: {groundedness_scores.mean()}")
+print(f"Average relevancy score: {relevancy_scores.mean()}")
