@@ -1,3 +1,6 @@
 data/.DS_Store
 .DS_Store
 /data/my_docs
+/data/embeddings
+/data/processed_docs
+/__pycache__
