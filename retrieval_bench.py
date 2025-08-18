@@ -1,14 +1,18 @@
 import torch
-import numpy as np
-import pandas as pd
 import pickle
 import difflib
 import re
+import nltk
+import requests
+import json
+import numpy as np
+import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+import gc
+from pathlib import Path
 from tqdm import tqdm
 from datasets import load_dataset
-from pathlib import Path
 from natsort import natsorted
 from transformers import AutoModel, AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer
@@ -18,8 +22,9 @@ from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 from marker.output import text_from_rendered
 from FlagEmbedding import FlagLLMReranker, LayerWiseFlagLLMReranker
-import requests
-import json
+from mxbai_rerank import MxbaiRerankV2
+from sklearn.preprocessing import minmax_scale
+from rank_bm25 import BM25Okapi
 
 class PdfProcessor:
     def __init__(self):
@@ -46,12 +51,33 @@ class PdfProcessor:
             return all_texts
 
 class BiEncoderPipeline:
+    _instances = {}  # Class variable to store instances
+    
+    def __new__(cls, 
+                model_name="Snowflake/snowflake-arctic-embed-l-v2.0",
+                chunk_size=1024,
+                chunk_overlap=0):
+        # Create a unique key for this model configuration
+        instance_key = f"{model_name}_{chunk_size}_{chunk_overlap}"
+        
+        # If an instance with this configuration doesn't exist, create it
+        if instance_key not in cls._instances:
+            cls._instances[instance_key] = super(BiEncoderPipeline, cls).__new__(cls)
+        
+        return cls._instances[instance_key]
+    
     def __init__(self, 
                  model_name="Snowflake/snowflake-arctic-embed-l-v2.0",
                  chunk_size=1024,
                  chunk_overlap=0):
         """Initialize BiEncoderPipeline with pre-loaded model"""
         
+        # Skip initialization if this instance was already initialized
+        if hasattr(self, 'initialized'):
+            return
+        
+        print(f"Initializing BiEncoderPipeline with model: {model_name}")
+        self.model_name = model_name
         self.model = SentenceTransformer(model_name)
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
@@ -60,46 +86,77 @@ class BiEncoderPipeline:
             chunk_overlap=chunk_overlap,
             length_function=len
         )
+        self.initialized = True
 
-    # def set_chunk_parameters(self, chunk_size=None, chunk_overlap=None):
-    #     if chunk_size:
-    #         self.chunk_size = chunk_size
-    #     if chunk_overlap:
-    #         self.chunk_overlap = chunk_overlap
-    #     self.text_splitter = RecursiveCharacterTextSplitter(
-    #         chunk_size=self.chunk_size,
-    #         chunk_overlap=self.chunk_overlap,
-    #         length_function=len
-    #     )
-
-    def embed_documents(self, doc_text, doc_id = None):
-        """Embed documents using pre-loaded models"""
+    def embed_documents(self, doc_text, doc_id = None, checkpoint_path=None, checkpoint_interval=10):
+        """Embed documents using pre-loaded models with checkpoint support"""
         # If string given (i.e., one document, big string), and not list (i.e., multiple documents or single document but list), make it a list
         if not isinstance(doc_text, list):
             doc_text = [doc_text]
 
+        # Check for existing checkpoint
+        results = []
+        start_idx = 0
+        if checkpoint_path and Path(checkpoint_path).exists():
+            print(f"Loading checkpoint from {checkpoint_path}")
+            with open(checkpoint_path, "rb") as f:
+                checkpoint_data = pickle.load(f)
+                results = checkpoint_data["results"]
+                start_idx = checkpoint_data["last_processed"] + 1
+            print(f"Resuming from document {start_idx}/{len(doc_text)}")
+
         # Process each text in the list
-        all_chunks = []
-        all_vectors = []
-        for i, doc in enumerate(doc_text):
+        for i, doc in tqdm(enumerate(doc_text), desc="Embedding documents", total=len(doc_text), initial=start_idx):
+            # Skip already processed documents
+            if i < start_idx:
+                continue
+                
             # Split the document into chunks
             doc_chunks = self.text_splitter.split_text(doc)
+            doc_chunks_embeddings = self.model.encode(doc_chunks)
             
-            # Store the chunks and their embeddings
-            all_chunks.append(doc_chunks)
-            all_vectors.append(self.model.encode(doc_chunks))
-
-        # Create results list; each element is a dict with the chunk text, its vector, its index, and the overall document index
-        results = []
-        for i, doc_chunks in enumerate(all_chunks): # For each document
-            for j, chunk in enumerate(doc_chunks): # For each chunk
+            for j, chunk in enumerate(doc_chunks):
                 results.append({
                     "text": chunk,
-                    "vector": all_vectors[i][j],
+                    "vector": doc_chunks_embeddings[j],
                     "original_doc_id": doc_id[i] if doc_id is not None else None,
                     "doc_idx": i,
                     "chunk_idx": j
                 })
+                
+                del chunk
+                gc.collect()
+                
+            # Clear memory
+            del doc_chunks
+            del doc_chunks_embeddings
+            gc.collect()
+            
+            # Save checkpoint every checkpoint_interval documents
+            if checkpoint_path and (i + 1) % checkpoint_interval == 0:
+                checkpoint_data = {
+                    "results": results,
+                    "last_processed": i,
+                    "total_documents": len(doc_text)
+                }
+                # Create checkpoint directory if it doesn't exist
+                Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(checkpoint_path, "wb") as f:
+                    pickle.dump(checkpoint_data, f)
+                print(f"Checkpoint saved at document {i + 1}/{len(doc_text)}")
+
+        # Save final checkpoint
+        if checkpoint_path:
+            checkpoint_data = {
+                "results": results,
+                "last_processed": len(doc_text) - 1,
+                "total_documents": len(doc_text),
+                "completed": True
+            }
+            with open(checkpoint_path, "wb") as f:
+                pickle.dump(checkpoint_data, f)
+            print(f"Final checkpoint saved - embedding completed")
+
         return results
     
     def retrieve_top_k(self, query, documents_embeddings, top_k=50):
@@ -125,15 +182,54 @@ class BiEncoderPipeline:
             }
             for i in top_indices
         ]
+        
+    def retrieve_all(self, query, documents_embeddings):
+        """Retrieve all embeddings using cosine similarity to the query"""
+        
+        # Embed query
+        query_vector = self.model.encode([query])   
+        
+        # Get embeddings from documents dicts
+        stored_vectors = np.array([item["vector"] for item in documents_embeddings])
+        
+        # Compute similarities between query and stored vectors
+        similarities = cosine_similarity(query_vector, stored_vectors).flatten()
+        
+        return [
+            {
+                **documents_embeddings[i],
+                "similarity": float(similarities[i])
+            }
+            for i in range(len(documents_embeddings))
+        ]
 
 class CrossEncoderPipeline:
+    _instances = {}  # Class variable to store instances
+    
+    def __new__(cls, model_name="cross-encoder/ms-marco-MiniLM-L6-v2", device=None):
+        # Create a unique key for this model configuration
+        instance_key = f"{model_name}_{device}"
+        
+        # If an instance with this configuration doesn't exist, create it
+        if instance_key not in cls._instances:
+            cls._instances[instance_key] = super(CrossEncoderPipeline, cls).__new__(cls)
+        
+        return cls._instances[instance_key]
+    
     def __init__(self, model_name="cross-encoder/ms-marco-MiniLM-L6-v2", device=None):
         """Initialize CrossEncoderPipeline with pre-loaded model"""
         
+        # Skip initialization if this instance was already initialized
+        if hasattr(self, 'initialized'):
+            return
+            
+        print(f"Initializing CrossEncoderPipeline with model: {model_name}")
+        self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
         self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
         self.model = self.model.to(self.device)
+        self.initialized = True
     
     def rerank(self, query, documents, top_n=4):
         """Rerank documents using cross-encoder"""
@@ -325,9 +421,212 @@ def quick_test(bi_encoder, cross_encoder, pdf_processor, doc_path, query, top_k=
     results_df = pd.DataFrame(reranked_results)
     results_df = results_df.drop(columns=["vector"])
     print(results_df)
+
+def prepare_techqa():
+    """
+    Prepare the TechQA dataset for retrieval benchmarking.
     
+    This function loads the TechQA dataset, filters it, processes documents,
+    removes duplicates, and saves the processed data.
     
-def retrieve_and_rerank(queries, embeddings, bi_encoder, cross_encoder, dataset, top_k=50, top_n=4, save_results=False, save_path=None):
+    Returns:
+        tuple: (techqa, techqa_exp) - The processed TechQA dataset and expanded version
+    """
+    # Check if techqa.pkl exists
+    if Path("techqa.pkl").exists():
+        print("Loading techqa from pickle file")
+        with open("techqa.pkl", "rb") as f:
+            techqa = pickle.load(f)
+    else:
+        # Prepare TechQA dataset
+        techqa_train = load_dataset("rungalileo/ragbench", "techqa", split="train").to_pandas()
+        techqa_val = load_dataset("rungalileo/ragbench", "techqa", split="validation").to_pandas()
+        techqa_test = load_dataset("rungalileo/ragbench", "techqa", split="test").to_pandas()
+
+        techqa = pd.concat([techqa_train, techqa_val, techqa_test], ignore_index=True)
+
+        # Filtering
+        techqa = techqa[techqa["generation_model_name"] == "gpt-3.5-turbo-0125"] # The authors tested two models, we only want the results for gpt-3.5-turbo-0125
+        techqa = techqa[["id", "question", "documents", "documents_sentences", "dataset_name", "all_relevant_sentence_keys", "all_utilized_sentence_keys"]]
+        techqa = techqa.rename(columns={"id": "question_id"})
+
+        # Redo id's
+        techqa = techqa.sample(frac=1, random_state=1).reset_index(drop=True)
+        techqa["question_id"] = techqa.index
+
+        # Save techqa
+        with open("techqa.pkl", "wb") as f:
+            pickle.dump(techqa, f)
+
+    # Check if techqa_exp.pkl exists
+    if Path("techqa_exp.pkl").exists():
+        print("Loading techqa_exp from pickle file")
+        with open("techqa_exp.pkl", "rb") as f:
+            techqa_exp = pickle.load(f)
+    else:
+        ##### GET DOCUMENTS, REMOVE DUPLICATES #####
+        # Create a new dataframe with each document as a separate row
+        techqa_exp = techqa.explode(list(('documents', 'documents_sentences'))).reset_index(drop=True)
+
+        # Create a new 'doc_id' column that combines question_id with document number
+        techqa_exp['doc_id'] = techqa_exp.groupby('question_id').cumcount() + 1
+        techqa_exp['doc_id'] = techqa_exp['question_id'].apply(lambda x: f'{x}') + '-' + techqa_exp['doc_id'].apply(lambda x: f'doc{x}')
+
+        # Keep only the 'documents', 'doc_id', and 'documents_sentences' columns
+        techqa_exp = techqa_exp[["documents", "doc_id", "documents_sentences"]]
+
+        ## Find duplicates
+        # Sort documents alphabetically
+        techqa_exp.sort_values(by='documents', inplace=True)
+        techqa_exp.reset_index(drop=True, inplace=True)
+
+        # Add a 'duplicated' column
+        techqa_exp["duplicated"] = False
+
+        # Compare each document with the next one
+        for i in range(len(techqa_exp)-1):
+            if techqa_exp.loc[i, "documents"] == techqa_exp.loc[i+1, "documents"]:
+                techqa_exp.loc[i, "duplicated"] = True
+                techqa_exp.loc[i+1, "doc_id"] = "_".join([techqa_exp.loc[i, "doc_id"],
+                                                        techqa_exp.loc[i+1, "doc_id"]])
+                
+        # Split doc_id column by "_"
+        techqa_exp["doc_id"] = techqa_exp["doc_id"].str.split("_")
+                
+        # Drop duplicates
+        techqa_exp = techqa_exp[techqa_exp["duplicated"] == False]
+        techqa_exp = techqa_exp.drop(columns=["duplicated"])
+        techqa_exp = techqa_exp.reset_index(drop=True)
+
+        # Save techqa_exp
+        with open("techqa_exp.pkl", "wb") as f:
+            pickle.dump(techqa_exp, f)
+        
+    return techqa, techqa_exp    
+
+def match_sentences_to_chunks(techqa_embed, techqa_exp, c_overlap):
+    wiggle_room = 1 if c_overlap > 0 else 0
+    previous_doc_idx = None
+    size_zero_counter = 0
+    m_counter = 0
+    for i, item in enumerate(techqa_embed):
+        chunk = item["text"] # The chunk to match
+        search_id = item["original_doc_id"][0] # The document id where the chunk comes from
+        doc_idx = item["doc_idx"]
+        techqa_embed[i]["sentence_matches"] = []
+        techqa_embed[i]["match_types"] = []
+        
+        print(f"\n\nchunk: {item['chunk_idx']}")
+        
+        # Remove punctuation from chunk
+        chunk_no_punct = ''.join(e for e in chunk if e.isalnum())
+        
+        # Find document in techqa_exp that the chunk comes from, get the sentences
+        doc_sentences = techqa_exp[techqa_exp['doc_id'].apply(lambda x: search_id in x)].documents_sentences.tolist()[0]
+        
+        # Create a dictionary of the sentences (key: sentence key, value: sentence text), and list of keys
+        doc_dict = {arr[0]: arr[1] for arr in doc_sentences}
+        doc_dict_keys = list(doc_dict.keys())
+        
+        # If doc_idx is different from the previous doc_idx, reset the last_match_key
+        if doc_idx != previous_doc_idx:
+            last_match_key = None
+            previous_doc_idx = doc_idx
+        
+        # For each sentence in the document, check if the chunk contains it
+        no_match_counter = 0 # Counter for # of times a sentence does not match the conditions
+        sentence_idx = -1
+        for key, sentence in doc_dict.items():
+            # Skip all sentences until the one before the last match (if last key is 3d, skip all sentences until key is 3c)
+            # You might think if last match was 3d in the previous chunk, then we should skip until 3d for the current chunk, but because of chunking overlap, the current chunk might still have 3c in it
+            if last_match_key is not None:
+                if doc_dict_keys.index(key) < last_match_key - wiggle_room:
+                    print(f"skipping key: {key}")
+                    continue
+            
+            sentence_idx += 1
+                    
+            print(f"\nchecking key: {key}")
+            sentence_no_punct = ''.join(e for e in sentence if e.isalnum())
+            
+            if len(chunk_no_punct) == 0 or len(sentence_no_punct) == 0:
+                no_match_counter = 0 # Reset the no_match_counter if the chunk or sentence is empty for wiggle room
+            
+            # Match sentence with chunk
+            s = difflib.SequenceMatcher(None,
+                                        chunk_no_punct,
+                                        sentence_no_punct,
+                                        autojunk=False)
+            
+            # Find the longest match
+            pos_a, pos_b, size = s.find_longest_match(0, len(chunk_no_punct),
+                                                    0, len(sentence_no_punct))
+            # pos_a is the start index of the match in the chunk
+            # pos_b is the start index of the match in the sentence
+            # size is the length of the match
+            # len(pos_a:pos_a+size) = len(pos_b:pos_b+size)
+            
+            # For the first two sentences, skip if the match is not at the beginning of the chunk 
+            if sentence_idx < 2 and pos_a > size:
+                m_counter += 1
+                continue
+            
+            matching_part = chunk_no_punct[pos_a:pos_a+size]
+            
+            # Skip if no match
+            if size == 0:
+                size_zero_counter += 1
+                no_match_counter += 1
+                if no_match_counter > 2:
+                    break
+                continue
+        
+            
+            ## Check conditions        
+            sentence_100_match = size == len(sentence_no_punct)
+            if sentence_100_match:
+                techqa_embed[i]["sentence_matches"].append(key)
+                last_match_key = doc_dict_keys.index(key)
+                
+                # Remove first instance of matching part
+                chunk_no_punct = chunk_no_punct.replace(matching_part, "", 1)
+                continue
+            
+            chunk_100_match = size == len(chunk_no_punct)
+            if chunk_100_match:
+                techqa_embed[i]["sentence_matches"].append(key)
+                last_match_key = doc_dict_keys.index(key)
+                break # If the sentence contains the whole chunk, then the next sentences will not contain any more matches
+    
+            contains_start = pos_a == 0 # The match starts at the beginning of the chunk (i.e., no text in the chunk before the match)
+            no_text_after = pos_b + size == len(sentence_no_punct) # The match is at the end of the sentence (i.e., no text in the sentence after the match)
+            matching_ratio = len(sentence_no_punct[pos_b:pos_b+size]) / len(sentence_no_punct) # Portion of the sentence that contains the match
+            if contains_start and no_text_after and matching_ratio >= 0.5:
+                techqa_embed[i]["sentence_matches"].append(key)
+                last_match_key = doc_dict_keys.index(key)
+                
+                chunk_no_punct = chunk_no_punct.replace(matching_part, "", 1)
+                continue
+                
+            contains_end = pos_a + size == len(chunk_no_punct) # The match is at the end of the chunk (i.e., no text in the chunk after the match)
+            no_text_before = pos_b == 0 # The match starts at the beginning of the sentence (i.e., no text in the sentence before the match)
+            if contains_end and no_text_before and matching_ratio >= 0.5:
+                techqa_embed[i]["sentence_matches"].append(key)
+                last_match_key = doc_dict_keys.index(key)
+                
+                chunk_no_punct = chunk_no_punct.replace(matching_part, "", 1)
+                continue
+            
+            else:
+                if sentence_idx > 0: # Because we go back an extra key for the previous chunk, don't count no_match_counter for the first sentence
+                    no_match_counter += 1
+                    if no_match_counter > 2:
+                        break
+                continue
+    
+    return techqa_embed
+    
+def retrieve_and_rerank(queries, embeddings, bi_encoder, cross_encoder, dataset, top_k=50, top_n=4, hyde_mode = False, hybrid_search = False, bm25_weight = 1, save_results=False, save_path=None):
     """
     Retrieves and reranks chunks for a list of queries.
     
@@ -344,41 +643,125 @@ def retrieve_and_rerank(queries, embeddings, bi_encoder, cross_encoder, dataset,
     Returns:
         list: List of dictionaries containing retrieval results
     """
+    if save_results:
+        if save_path is None:
+            raise ValueError("save_path must be provided if save_results is True")
+        
+        if not Path(save_path).parent.exists() and str(Path(save_path).parent) != ".":
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        
+        # Skip already processed queries
+        if Path(save_path).exists():
+            print("Loading results from pickle file")
+            with open(save_path, "rb") as f:
+                results_list = pickle.load(f)
+                n_already_processed = len(results_list)
+            print(f"Skipping {n_already_processed} already processed queries")
+        else:
+            results_list = []
+            n_already_processed = 0
+    
     # Handle different input types
     if not isinstance(queries, list):
         queries = queries.question.tolist()
+        
+    # Load tokenized corpus if hybrid search is enabled
+    if hybrid_search:
+        size = bi_encoder.chunk_size
+        overlap = bi_encoder.chunk_overlap
+        corpus_path = f"data/tokenized_techqa_{size}_{overlap}.pkl"
+        if Path(corpus_path).exists():
+            print("Loading tokenized corpus from pickle file")
+            with open(corpus_path, "rb") as f:
+                tokenized_corpus = pickle.load(f)
+        else:
+            print("Tokenizing corpus")
+            corpus = [doc["text"] for doc in embeddings]
+            tokenized_corpus = [nltk.word_tokenize(doc) for doc in corpus]
+            with open(corpus_path, "wb") as f:
+                pickle.dump(tokenized_corpus, f)
+        
+        bm25 = BM25Okapi(tokenized_corpus)   
     
-    results_list = []
+    # Retrieve and rerank
     for i, query in tqdm(enumerate(queries), total=len(queries), desc="Processing queries"):
-        top_chunks = bi_encoder.retrieve_top_k(query, embeddings, top_k=top_k)  # Retrieve top chunks for each query
-        reranked_results = cross_encoder.rerank(query, top_chunks, top_n=top_n)  # Rerank the chunks
-        reranked_results = [{k: v for k, v in d.items() if k not in ["vector", "match_types"]} for d in reranked_results]
+        if i < n_already_processed:
+            continue
+
+        if hybrid_search:
+            all_chunks_dense = bi_encoder.retrieve_all(query, embeddings)
+            all_chunks_dense_scores = np.array([d["similarity"] for d in all_chunks_dense])
+            all_chunks_bm25_scores = bm25.get_scores(nltk.word_tokenize(query))
+            all_chunks_bm25_scores = minmax_scale(all_chunks_bm25_scores) # normalize bm25 scores (0-1)
+            
+            # # histogram of all_chunks_dense_scores
+            # plt.hist(all_chunks_dense_scores, bins=100)
+            # plt.show()
+            
+            # # histogram of all_chunks_bm25_scores
+            # plt.hist(all_chunks_bm25_scores, bins=100)
+            # plt.show()
+            
+            all_chunks_scores = all_chunks_dense_scores + all_chunks_bm25_scores*bm25_weight # combine scores
+            
+            # get top k chunks            
+            top_chunks_indices = np.argsort(all_chunks_scores)[-top_k:][::-1]
+            top_chunks = [
+                {
+                    **all_chunks_dense[j],
+                    "bm25_score": all_chunks_bm25_scores[j],
+                    "retrieval_score": all_chunks_scores[j]
+                }
+                for j in top_chunks_indices
+            ]     
+        else:   
+            top_chunks = bi_encoder.retrieve_top_k(query, embeddings, top_k=top_k)  # Retrieve top chunks for each query
+        
+        if isinstance(cross_encoder, MxbaiRerankV2):
+            top_chunks_mxbai = [entry["text"] for entry in top_chunks]
+            
+            # rerank in halves to avoid memory issues
+            rerankings_half_1 = cross_encoder.rank(query, top_chunks_mxbai[:25], top_k=top_n)  # Rerank the chunks  
+            rerankings_half_2 = cross_encoder.rank(query, top_chunks_mxbai[25:], top_k=top_n)  # Rerank the chunks
+            for d in rerankings_half_2:
+                d.index += 25
+            
+            # combine rerankings
+            rerankings = rerankings_half_1 + rerankings_half_2
+
+            # sort rerankings by score and keep only top_n
+            rerankings = sorted(rerankings, key=lambda x: x.score, reverse=True)[:top_n]
+            
+            reranked_scores = [d.score for d in rerankings]
+            reranked_indices = [d.index for d in rerankings]
+            reranked_results = [
+                {
+                    **{k: v for k, v in top_chunks[reranked_indices[i]].items() if k not in ["vector", "match_types"]},
+                    "rerank_score": reranked_scores[i]
+                }
+                for i in range(top_n)
+            ]
+        else:
+            reranked_results = cross_encoder.rerank(query, top_chunks, top_n=top_n)  # Rerank the chunks
+            reranked_results = [{k: v for k, v in d.items() if k not in ["vector", "match_types"]} for d in reranked_results]
         
         expected_sentences = dataset.loc[i, "all_relevant_sentence_keys"]
-        
         full_results = {"query": query,
                         "question_id": dataset.loc[i, "question_id"],
                         "expected": expected_sentences,
                         "results": reranked_results}
         results_list.append(full_results)
     
-    # Save results if requested
-    if save_results:
-        # Error if save_path is not provided
-        if save_path is None:
-            raise ValueError("save_path must be provided if save_results is True")
-        
-        # Create directory if it doesn't exist
-        if not Path(save_path).parent.exists() and str(Path(save_path).parent) != ".":
-            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-            
-        with open(save_path, "wb") as f:
-            pickle.dump(results_list, f)
-        print(f"Results saved to {save_path}")
+        # Save results if requested
+        if save_results:            
+            # Save every 10 iterations and during the last iteration
+            if i % 10 == 0 or i == len(queries) - 1:
+                with open(save_path, "wb") as f:
+                    pickle.dump(results_list, f)
+                print(f"Results saved to {save_path} at iteration {i + 1}")
     
     return results_list
-  
-        
+          
 def compute_recall(results_list):
     """
     Compute recall for a list of retrieval results.
@@ -447,268 +830,198 @@ def compute_recall(results_list):
         
     return np.nanmean(recalls), recalls
 
-
-# Pipeline initialization
-# pdf_processor = PdfProcessor()
-# bi_encoder = BiEncoderPipeline()
-# cross_encoder = CrossEncoderPipeline(model_name="Alibaba-NLP/gte-reranker-modernbert-base")
-cross_encoder = CrossEncoderPipeline()
-
-
-
-##################### TECHQA #####################
-## Load dataset
-# techqa_train = load_dataset("rungalileo/ragbench", "techqa", split="train").to_pandas()
-# techqa_val = load_dataset("rungalileo/ragbench", "techqa", split="validation").to_pandas()
-# techqa_test = load_dataset("rungalileo/ragbench", "techqa", split="test").to_pandas()
-
-# techqa = pd.concat([techqa_train, techqa_val, techqa_test], ignore_index=True)
-
-# # Filtering
-# techqa = techqa[techqa["generation_model_name"] == "gpt-3.5-turbo-0125"] # The authors tested two models, we only want the results for gpt-3.5-turbo-0125
-# techqa = techqa[["id", "question", "documents", "documents_sentences", "dataset_name", "all_relevant_sentence_keys", "all_utilized_sentence_keys"]]
-# techqa = techqa.rename(columns={"id": "question_id"})
-
-# # Redo id's
-# techqa = techqa.sample(frac=1, random_state=1).reset_index(drop=True)
-# techqa["question_id"] = techqa.index
-
-# # Save techqa
-# with open("techqa.pkl", "wb") as f:
-#     pickle.dump(techqa, f)
-
-# Load techqa
-with open("techqa.pkl", "rb") as f:
-    techqa = pickle.load(f)
-
-# ##### GET DOCUMENTS, REMOVE DUPLICATES #####
-# # Create a new dataframe with each document as a separate row
-# techqa_exp = techqa.explode(list(('documents', 'documents_sentences'))).reset_index(drop=True)
-
-# # Create a new 'doc_id' column that combines question_id with document number
-# techqa_exp['doc_id'] = techqa_exp.groupby('question_id').cumcount() + 1
-# techqa_exp['doc_id'] = techqa_exp['question_id'].apply(lambda x: f'{x}') + '-' + techqa_exp['doc_id'].apply(lambda x: f'doc{x}')
-
-# # Keep only the 'documents', 'doc_id', and 'documents_sentences' columns
-# techqa_exp = techqa_exp[["documents", "doc_id", "documents_sentences"]]
-
-# ## Find duplicates
-# # Sort documents alphabetically
-# techqa_exp.sort_values(by='documents', inplace=True)
-# techqa_exp.reset_index(drop=True, inplace=True)
-
-# # Add a 'duplicated' column
-# techqa_exp["duplicated"] = False
-
-# # Compare each document with the next one
-# for i in range(len(techqa_exp)-1):
-#     if techqa_exp.loc[i, "documents"] == techqa_exp.loc[i+1, "documents"]:
-#         techqa_exp.loc[i, "duplicated"] = True
-#         techqa_exp.loc[i+1, "doc_id"] = "_".join([techqa_exp.loc[i, "doc_id"],
-#                                                        techqa_exp.loc[i+1, "doc_id"]])
+def retrieve_only(queries, embeddings, bi_encoder, dataset, top_k=50, hyde_mode = False, hybrid_search = False, bm25_weight = 1, save_results=False, save_path=None):
+    """
+    Retrieves chunks for a list of queries. No reranking.
+    
+    Args:
+        queries: List of query strings or DataFrame with 'question' column
+        embeddings: Embedded chunks to search through
+        bi_encoder: Bi-encoder model for initial retrieval
+        dataset: DataFrame containing metadata about queries
+        top_k: Number of top chunks to retrieve (default: 50)
+        save_results: Whether to save the results list as a pickle file (default: False)
+        save_path: Path to save the results list (default: None, which saves to current directory)
         
-# # Split doc_id column by "_"
-# techqa_exp["doc_id"] = techqa_exp["doc_id"].str.split("_")
+    Returns:
+        list: List of dictionaries containing retrieval results
+    """
+    results_list = []
+    n_already_processed = 0
+    
+    if save_results:
+        if save_path is None:
+            raise ValueError("save_path must be provided if save_results is True")
         
-# # Drop duplicates
-# techqa_exp = techqa_exp[techqa_exp["duplicated"] == False]
-# techqa_exp = techqa_exp.drop(columns=["duplicated"])
-# techqa_exp = techqa_exp.reset_index(drop=True)
+        if not Path(save_path).parent.exists() and str(Path(save_path).parent) != ".":
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        
+        # Skip already processed queries
+        if Path(save_path).exists():
+            print("Loading results from pickle file")
+            with open(save_path, "rb") as f:
+                results_list = pickle.load(f)
+                n_already_processed = len(results_list)
+            print(f"Skipping {n_already_processed} already processed queries")
+        
+        
+    # Load tokenized corpus if hybrid search is enabled
+    if hybrid_search:
+        size = bi_encoder.chunk_size
+        overlap = bi_encoder.chunk_overlap
+        corpus_path = f"data/tokenized_techqa_{size}_{overlap}.pkl"
+        if Path(corpus_path).exists():
+            print("Loading tokenized corpus from pickle file")
+            with open(corpus_path, "rb") as f:
+                tokenized_corpus = pickle.load(f)
+        else:
+            print("Tokenizing corpus")
+            corpus = [doc["text"] for doc in embeddings]
+            tokenized_corpus = [nltk.word_tokenize(doc) for doc in corpus]
+            with open(corpus_path, "wb") as f:
+                pickle.dump(tokenized_corpus, f)
+        
+        bm25 = BM25Okapi(tokenized_corpus)     
+    if not isinstance(queries, list):
+        queries = queries.question.tolist()
+        
+    for i, query in tqdm(enumerate(queries), total=len(queries), desc="Processing queries"):
+        if i < n_already_processed:
+            continue
+            
+        if hybrid_search:
+            all_chunks_dense = bi_encoder.retrieve_all(query, embeddings)
+            all_chunks_dense_scores = np.array([d["similarity"] for d in all_chunks_dense])
+            all_chunks_bm25_scores = bm25.get_scores(nltk.word_tokenize(query))
+            all_chunks_bm25_scores = minmax_scale(all_chunks_bm25_scores) # normalize bm25 scores (0-1)
+            
+            all_chunks_scores = all_chunks_dense_scores + all_chunks_bm25_scores*bm25_weight # combine scores
+            
+            # get top k chunks            
+            top_chunks_indices = np.argsort(all_chunks_scores)[-top_k:][::-1]
+            top_chunks = [
+                {
+                    **all_chunks_dense[j],
+                    "bm25_score": all_chunks_bm25_scores[j],
+                    "retrieval_score": all_chunks_scores[j]
+                }
+                for j in top_chunks_indices
+            ]
+        else:
+            top_chunks = bi_encoder.retrieve_top_k(query, embeddings, top_k=top_k)  # Retrieve top chunks for each query
+            
+        expected_sentences = dataset.loc[i, "all_relevant_sentence_keys"]
+        full_results = {"query": query,
+                        "question_id": dataset.loc[i, "question_id"],
+                        "expected": expected_sentences,
+                        "results": top_chunks}
+        results_list.append(full_results)
+        
+        # Save results if requested
+        if save_results:            
+            # Save every 10 iterations and during the last iteration
+            if i % 10 == 0 or i == len(queries) - 1:
+                with open(save_path, "wb") as f:
+                    pickle.dump(results_list, f)
+                print(f"Results saved to {save_path} at iteration {i + 1}")
+                
+    return results_list
 
-# # Save techqa_exp
-# with open("techqa_exp.pkl", "wb") as f:
-#     pickle.dump(techqa_exp, f)
-
-# Load techqa_exp
-with open("techqa_exp.pkl", "rb") as f:
-    techqa_exp = pickle.load(f)
 
 # ##### TECHQA EMBEDDING #####
-# bi_encoder_1000_0 = BiEncoderPipeline(chunk_size=1000,
-#                                       chunk_overlap=0)
-
-# # Embed documents
-# techqa_embed = bi_encoder_1000_0.embed_documents(techqa_exp.documents.to_list(),
-#                                                  techqa_exp.doc_id.to_list())
-
-# # Save embeddings
-# output_path = Path("techqa_embeddings/MiniLM-L6-v2")
-# output_path.mkdir(parents=True, exist_ok=True)
-# with open(output_path / "size-1000_overlap-0.pkl", "wb") as f:
-#     pickle.dump(techqa_embed, f)
-    
-# # Load embeddings
-# with open(output_path / "size-1000_overlap-100.pkl", "rb") as f:
-#     techqa_embed = pickle.load(f)
-
+techqa, techqa_exp = prepare_techqa()
 techqa_questions = techqa.question.tolist()
-chunk_size = [1024, 2048, 4096]
-chunk_overlap = [0, 128]
+
+bi_encoder_model_name = "Qwen/Qwen3-Embedding-0.6B"
+cross_encoder_model_name = "cross-encoder/ms-marco-MiniLM-L6-v2"
+cross_encoder = CrossEncoderPipeline(cross_encoder_model_name, device = "cpu")
+
+bi_encoder_model_name_short = bi_encoder_model_name.split("/")[0]
+cross_encoder_model_name_short = cross_encoder_model_name.split("/")[1]
+
+chunk_size = [2048]
+chunk_overlap = [128]
+top_n = 8
 for c_size in chunk_size:
     for c_overlap in chunk_overlap:
         print(f"c_size: {c_size}, c_overlap: {c_overlap}")
         
         bi_encoder_text_embedding = BiEncoderPipeline(
-            model_name="Snowflake/snowflake-arctic-embed-l-v2.0",
+            model_name=bi_encoder_model_name,
             chunk_size=c_size,
             chunk_overlap=c_overlap
             )
         
-        techqa_embed = bi_encoder_text_embedding.embed_documents(techqa_exp.documents.to_list(),
-                                                                 techqa_exp.doc_id.to_list())
+        ## Embed documents
+        # Define embedding paths
+        embedding_dir = Path(f"techqa_embeddings/{bi_encoder_model_name_short}/size{c_size}/overlap{c_overlap}")
+        matched_path = embedding_dir / "embeddings_matched.pkl"
+        regular_path = embedding_dir / "embeddings.pkl"
+        checkpoint_path = embedding_dir / "embedding_checkpoint.pkl"
+        
+        # Check for existing embeddings
+        matched = False
+        if matched_path.exists():
+            print("Loading embeddings with matched sentences from pickle file")
+            matched = True
+            with open(matched_path, "rb") as f:
+                techqa_embed = pickle.load(f)
+        elif regular_path.exists():
+            print("Loading embeddings from pickle file, no matched sentences")
+            with open(regular_path, "rb") as f:
+                techqa_embed = pickle.load(f)
+        else:
+            print("Embedding documents with checkpoint support")
+            techqa_embed = bi_encoder_text_embedding.embed_documents(
+                techqa_exp.documents.to_list(),
+                techqa_exp.doc_id.to_list(),
+                checkpoint_path=str(checkpoint_path),
+                checkpoint_interval=10
+            )
         
         # Save embeddings
-        with open(f"techqa_embeddings/Snowflake/size{c_size}/overlap{c_overlap}/embeddings.pkl", "wb") as f:
-            pickle.dump(techqa_embed, f)
-        
-        wiggle_room = 1 if c_overlap > 0 else 0
-        previous_doc_idx = None
-        size_zero_counter = 0
-        m_counter = 0
-        for i, item in enumerate(techqa_embed):
-            chunk = item["text"] # The chunk to match
-            search_id = item["original_doc_id"][0] # The document id where the chunk comes from
-            doc_idx = item["doc_idx"]
-            techqa_embed[i]["sentence_matches"] = []
-            techqa_embed[i]["match_types"] = []
+        if not matched:
+            # create embedding directory if it doesn't exist
+            embedding_dir.mkdir(parents=True, exist_ok=True)
+            with open(regular_path, "wb") as f:
+                pickle.dump(techqa_embed, f)
             
-            print(f"\n\nchunk: {item['chunk_idx']}")
+            # Match TechQA sentences to embedded chunks
+            techqa_embed_final = match_sentences_to_chunks(techqa_embed,
+                                                           techqa_exp,
+                                                           c_overlap)
             
-            # Remove punctuation from chunk
-            chunk_no_punct = ''.join(e for e in chunk if e.isalnum())
-            
-            # Find document in techqa_exp that the chunk comes from, get the sentences
-            doc_sentences = techqa_exp[techqa_exp['doc_id'].apply(lambda x: search_id in x)].documents_sentences.tolist()[0]
-            
-            # Create a dictionary of the sentences (key: sentence key, value: sentence text), and list of keys
-            doc_dict = {arr[0]: arr[1] for arr in doc_sentences}
-            doc_dict_keys = list(doc_dict.keys())
-            
-            # If doc_idx is different from the previous doc_idx, reset the last_match_key
-            if doc_idx != previous_doc_idx:
-                last_match_key = None
-                previous_doc_idx = doc_idx
-            
-            # For each sentence in the document, check if the chunk contains it
-            no_match_counter = 0 # Counter for # of times a sentence does not match the conditions
-            sentence_idx = -1
-            for key, sentence in doc_dict.items():
-                # Skip all sentences until the one before the last match (if last key is 3d, skip all sentences until key is 3c)
-                # You might think if last match was 3d in the previous chunk, then we should skip until 3d for the current chunk, but because of chunking overlap, the current chunk might still have 3c in it
-                if last_match_key is not None:
-                    if doc_dict_keys.index(key) < last_match_key - wiggle_room:
-                        print(f"skipping key: {key}")
-                        continue
-                
-                sentence_idx += 1
-                        
-                print(f"\nchecking key: {key}")
-                sentence_no_punct = ''.join(e for e in sentence if e.isalnum())
-                
-                if len(chunk_no_punct) == 0 or len(sentence_no_punct) == 0:
-                    no_match_counter = 0 # Reset the no_match_counter if the chunk or sentence is empty for wiggle room
-                
-                # Match sentence with chunk
-                s = difflib.SequenceMatcher(None,
-                                            chunk_no_punct,
-                                            sentence_no_punct,
-                                            autojunk=False)
-                
-                # Find the longest match
-                pos_a, pos_b, size = s.find_longest_match(0, len(chunk_no_punct),
-                                                          0, len(sentence_no_punct))
-                # pos_a is the start index of the match in the chunk
-                # pos_b is the start index of the match in the sentence
-                # size is the length of the match
-                # len(pos_a:pos_a+size) = len(pos_b:pos_b+size)
-                
-                # For the first two sentences, skip if the match is not at the beginning of the chunk 
-                if sentence_idx < 2 and pos_a > size:
-                    m_counter += 1
-                    continue
-                
-                matching_part = chunk_no_punct[pos_a:pos_a+size]
-                
-                # Skip if no match
-                if size == 0:
-                    size_zero_counter += 1
-                    no_match_counter += 1
-                    if no_match_counter > 2:
-                        break
-                    continue
-            
-                
-                ## Check conditions        
-                sentence_100_match = size == len(sentence_no_punct)
-                if sentence_100_match:
-                    techqa_embed[i]["sentence_matches"].append(key)
-                    last_match_key = doc_dict_keys.index(key)
-                    
-                    # Remove first instance of matching part
-                    chunk_no_punct = chunk_no_punct.replace(matching_part, "", 1)
-                    continue
-                
-                chunk_100_match = size == len(chunk_no_punct)
-                if chunk_100_match:
-                    techqa_embed[i]["sentence_matches"].append(key)
-                    last_match_key = doc_dict_keys.index(key)
-                    break # If the sentence contains the whole chunk, then the next sentences will not contain any more matches
-        
-                contains_start = pos_a == 0 # The match starts at the beginning of the chunk (i.e., no text in the chunk before the match)
-                no_text_after = pos_b + size == len(sentence_no_punct) # The match is at the end of the sentence (i.e., no text in the sentence after the match)
-                matching_ratio = len(sentence_no_punct[pos_b:pos_b+size]) / len(sentence_no_punct) # Portion of the sentence that contains the match
-                if contains_start and no_text_after and matching_ratio >= 0.5:
-                    techqa_embed[i]["sentence_matches"].append(key)
-                    last_match_key = doc_dict_keys.index(key)
-                    
-                    chunk_no_punct = chunk_no_punct.replace(matching_part, "", 1)
-                    continue
-                    
-                contains_end = pos_a + size == len(chunk_no_punct) # The match is at the end of the chunk (i.e., no text in the chunk after the match)
-                no_text_before = pos_b == 0 # The match starts at the beginning of the sentence (i.e., no text in the sentence before the match)
-                if contains_end and no_text_before and matching_ratio >= 0.5:
-                    techqa_embed[i]["sentence_matches"].append(key)
-                    last_match_key = doc_dict_keys.index(key)
-                    
-                    chunk_no_punct = chunk_no_punct.replace(matching_part, "", 1)
-                    continue
-                
-                else:
-                    if sentence_idx > 0: # Because we go back an extra key for the previous chunk, don't count no_match_counter for the first sentence
-                        no_match_counter += 1
-                        if no_match_counter > 2:
-                            break
-                    continue
-                    
-                    
-        techqa_embed_final = techqa_embed
-        with open(f"techqa_embeddings/Snowflake/size{c_size}/overlap{c_overlap}/embeddings_final.pkl", "wb") as f:
-            pickle.dump(techqa_embed_final, f)
-            
+            with open(matched_path, "wb") as f:
+                pickle.dump(techqa_embed_final, f)
             
         # Load embeddings
-        with open(f"techqa_embeddings/Snowflake/size{c_size}/overlap{c_overlap}/embeddings_final.pkl", "rb") as f:
+        with open(matched_path, "rb") as f:
             techqa_embed_final = pickle.load(f)
             
-        results_list = []
-        for i, query in tqdm(enumerate(techqa.question), total=len(techqa.question), desc="Processing queries"):
-            top_chunks = bi_encoder_text_embedding.retrieve_top_k(query, techqa_embed_final, top_k=50) # Retrieve top 50 chunks for eachq query
-            reranked_results = cross_encoder.rerank(query, top_chunks, top_n=16) # Rerank the chunks
-            reranked_results = [{k: v for k, v in d.items() if k not in ["vector", "match_types"]} for d in reranked_results]
-            
-            expected_sentences = techqa.loc[i, "all_relevant_sentence_keys"]
-            
-            full_results = {"query": query,
-                            "question_id": techqa.loc[i, "question_id"],
-                            "expected": expected_sentences,
-                            "results": reranked_results}
-            results_list.append(full_results)
-            
-        # Save
-        with open(f"techqa_results/Snowflake/size{c_size}/overlap{c_overlap}/miniLM-L6-v2/topn16/results.pkl", "wb") as f:
-            pickle.dump(results_list, f)
+        results_list = retrieve_and_rerank(queries=techqa_questions, 
+                                           embeddings=techqa_embed_final, 
+                                           bi_encoder=bi_encoder_text_embedding, 
+                                           cross_encoder=cross_encoder, 
+                                           dataset=techqa, 
+                                           top_k=50, 
+                                           top_n=8,
+                                           hybrid_search=True,
+                                           bm25_weight=1,
+                                           save_results=True,
+                                           save_path=f"techqa_results/{bi_encoder_model_name_short}/size{c_size}/overlap{c_overlap}/{cross_encoder_model_name_short}/topn{top_n}/results.pkl")
         
         
+results_retrieve_only = retrieve_only(queries=techqa_questions, 
+                                      embeddings=techqa_embed_final, 
+                                      bi_encoder=bi_encoder_text_embedding, 
+                                      dataset=techqa, 
+                                      top_k=50, 
+                                      hybrid_search=True,
+                                      bm25_weight=0,
+                                      save_results=False)
+recall_mean, recalls = compute_recall(results_retrieve_only)
+print(f"Recall mean: {recall_mean}")
+
 ## Match chunks and TechQA sentences
 # READ TO UNDERSTAND (CONDITIONS):
 # 1. Given a text chunk and a sentence we want to match (two strings), the sentence must either fully be or contain a substring of the chunk.
@@ -723,7 +1036,7 @@ for c_size in chunk_size:
 
 ########## BENCHMARK TECHQA ##########
 # Compute recall mean, ignore nan's
-results_list = pickle.load(open("techqa_results/Snowflake/gte-cross-encoder_results_list_size-1024_overlap-0.pkl", "rb"))
+results_list = pickle.load(open("techqa_results/Snowflake/size2048/overlap128/mxbai-rerank-base-v2/topn8/results.pkl", "rb"))
 recall_mean, recalls = compute_recall(results_list)
 print(f"Recall mean: {recall_mean}")
 
